@@ -4,64 +4,75 @@ from flask import Flask
 from motor.motor_asyncio import AsyncIOMotorClient
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, KeyboardButtonRequestChat
 
 # --- CONFIG ---
 ADMINS = [8128433095]
 MONGO_URL = "mongodb+srv://miktexstudio:roma1111@cluster0.6damzqi.mongodb.net/"
 TOKEN = "8556619747:AAFA1ZOfobW_N7dt2fhrPPBl7jTdHAPWfzc"
 
-logging.basicConfig(level=logging.INFO, format='%(message)s')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
 # --- DATABASE ---
 client = AsyncIOMotorClient(MONGO_URL)
 db = client.miktex_db
-col_channels, col_users, col_logs = db.channels, db.users, db.logs
-col_history, col_blacklist = db.history, db.blacklist
+col_channels = db.channels
+col_users = db.users
+col_logs = db.logs
 
 app = Flask(__name__)
 @app.route('/')
-def index(): return "MIKTEX CONTROL - Разработчик MIKTEX"
+def index(): return "MIKTEX CORE ACTIVE"
 
-# --- CACHE & STATES ---
-admin_cache = {}
-state_data = {} # Для хранения состояния ввода (ад, текст, канал)
+# --- CACHE & UTILS ---
+admin_cache = {} # Хранит список админов, чтобы не дергать API ТГ каждую секунду
 
 def get_format_time(s):
-    if s < 60: return f"{s}s"
-    if s < 3600: return f"{s//60}m"
-    return f"{s//3600}h"
+    if s < 60: return f"{int(s)}s"
+    if s < 3600: return f"{int(s//60)}m"
+    return f"{int(s//3600)}h"
 
-# --- CORE LOGIC ---
+# --- INTERFACE ---
 
 @dp.message(Command("start"))
 async def cmd_start(m: types.Message):
     await col_users.update_one({"user_id": m.from_user.id}, {"$set": {"user_id": m.from_user.id}}, upsert=True)
     kb = [
-        [InlineKeyboardButton(text="Мои ресурсы", callback_data="list")],
-        [InlineKeyboardButton(text="Глобальный ЧС", callback_data="g_ban_list")]
+        [InlineKeyboardButton(text="Привязать ресурс", callback_data="add_instr")],
+        [InlineKeyboardButton(text="Мои каналы", callback_data="list")]
     ]
-    if m.from_user.id in ADMINS:
-        kb.append([InlineKeyboardButton(text="АДМИН ПАНЕЛЬ", callback_data="admin_main")])
-    
-    await m.answer("MIKTEX CONTROL - Система активна\nПерешлите пост из канала для привязки.", 
-                   reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+    await m.answer("MIKTEX CONTROL\nСистема мониторинга активна.", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
 
-@dp.message(F.forward_from_chat)
-async def handle_forward(m: types.Message):
-    if m.forward_from_chat.type != "channel": return
-    cid = m.forward_from_chat.id
-    await col_channels.update_one(
-        {"chat_id": cid},
-        {"$set": {"title": m.forward_from_chat.title, "owner_id": m.from_user.id, "mute": False},
-         "$setOnInsert": {"ad_cd": 18000, "msg_cd": 30, "total": 0}},
-        upsert=True
-    )
-    await m.answer(f"Канал {m.forward_from_chat.title} успешно подключен.")
+@dp.callback_query(F.data == "add_instr")
+async def add_instr(cb: CallbackQuery):
+    kb = types.ReplyKeyboardMarkup(keyboard=[
+        [types.KeyboardButton(text="Выбрать канал", request_chat=KeyboardButtonRequestChat(
+            request_id=1, chat_is_channel=True, bot_is_member=True,
+            bot_administrator_rights=types.ChatAdministratorRights(can_delete_messages=True)
+        ))]
+    ], resize_keyboard=True, one_time_keyboard=True)
+    await cb.message.answer("Используйте системную кнопку для привязки (Доступно только владельцу):", reply_markup=kb)
 
-# --- MANAGEMENT ---
+@dp.message(F.chat_shared)
+async def chat_shared_handler(m: types.Message):
+    cid = m.chat_shared.chat_id
+    try:
+        member = await bot.get_chat_member(cid, m.from_user.id)
+        if member.status != 'creator':
+            return await m.answer("Ошибка: Привязка разрешена только Создателю канала.")
+        
+        chat = await bot.get_chat(cid)
+        await col_channels.update_one(
+            {"chat_id": cid},
+            {"$set": {"title": chat.title, "owner_id": m.from_user.id},
+             "$setOnInsert": {"ad_cd": 18000, "msg_cd": 30}},
+            upsert=True
+        )
+        await m.answer(f"Канал {chat.title} успешно привязан.", reply_markup=types.ReplyKeyboardRemove())
+    except Exception:
+        await m.answer("Ошибка: Бот должен быть администратором в канале.")
 
 @dp.callback_query(F.data == "list")
 async def list_ch(cb: CallbackQuery):
@@ -69,146 +80,106 @@ async def list_ch(cb: CallbackQuery):
     btns = []
     async for r in cursor:
         btns.append([InlineKeyboardButton(text=r['title'], callback_data=f"cfg_{r['chat_id']}")])
-    btns.append([InlineKeyboardButton(text="Назад", callback_data="back_to_start")])
-    await cb.message.edit_text("Ваши каналы:", reply_markup=InlineKeyboardMarkup(inline_keyboard=btns))
+    btns.append([InlineKeyboardButton(text="Назад", callback_data="to_start")])
+    await cb.message.edit_text("Ваши ресурсы:", reply_markup=InlineKeyboardMarkup(inline_keyboard=btns))
 
 @dp.callback_query(F.data.startswith("cfg_"))
 async def cfg_ch(cb: CallbackQuery):
     cid = int(cb.data.split("_")[1])
     c = await col_channels.find_one({"chat_id": cid})
-    m_stat = "АКТИВЕН" if c.get("mute") else "ВЫКЛ"
-    
     text = (f"РЕСУРС: {c['title']}\n"
             f"КД Реклама: {get_format_time(c['ad_cd'])}\n"
-            f"КД Текст: {get_format_time(c['msg_cd'])}\n"
-            f"Удалено: {c.get('total', 0)}\n"
-            f"Режим тишины: {m_stat}")
-    
+            f"КД Текст: {get_format_time(c['msg_cd'])}")
     kb = [
-        [InlineKeyboardButton(text="КД Реклама (часы)", callback_data=f"set_ad_{cid}"),
-         InlineKeyboardButton(text="КД Текст (секунды)", callback_data=f"set_msg_{cid}")],
-        [InlineKeyboardButton(text="Тишина (Вкл/Выкл)", callback_data=f"mute_toggle_{cid}")],
+        [InlineKeyboardButton(text="Реклама (часы)", callback_data=f"set_ad_{cid}"),
+         InlineKeyboardButton(text="Текст (секунды)", callback_data=f"set_msg_{cid}")],
         [InlineKeyboardButton(text="Назад", callback_data="list")]
     ]
     await cb.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
 
 @dp.callback_query(F.data.startswith("set_"))
-async def set_cd(cb: CallbackQuery):
+async def set_vals(cb: CallbackQuery):
     _, mode, cid = cb.data.split("_")
-    btns, row = [], []
-    # Реклама в часах, сообщения в секундах
     vals = [1, 2, 6, 12, 24] if mode == "ad" else [10, 15, 20, 30, 45, 60]
-    for v in vals:
-        sec = v * 3600 if mode == "ad" else v
-        label = f"{v}ч" if mode == "ad" else f"{v}с"
-        row.append(InlineKeyboardButton(text=label, callback_data=f"save_{mode}_{cid}_{sec}"))
-        if len(row) == 3: btns.append(row); row = []
-    if row: btns.append(row)
-    btns.append([InlineKeyboardButton(text="Свое значение", callback_data=f"input_{mode}_{cid}")])
-    btns.append([InlineKeyboardButton(text="Назад", callback_data=f"cfg_{cid}")])
-    await cb.message.edit_text(f"Выберите лимит ({'часы' if mode=='ad' else 'секунды'}):", reply_markup=InlineKeyboardMarkup(inline_keyboard=btns))
+    row = [InlineKeyboardButton(text=f"{v}{'h' if mode=='ad' else 's'}", 
+           callback_data=f"sv_{mode}_{cid}_{v * 3600 if mode=='ad' else v}") for v in vals]
+    await cb.message.edit_text("Выберите новый лимит:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[row, [InlineKeyboardButton(text="Назад", callback_data=f"cfg_{cid}")]]))
 
-@dp.callback_query(F.data.startswith("save_"))
-async def save_val(cb: CallbackQuery):
+@dp.callback_query(F.data.startswith("sv_"))
+async def save_vals(cb: CallbackQuery):
     _, mode, cid, val = cb.data.split("_")
     field = "ad_cd" if mode == "ad" else "msg_cd"
     await col_channels.update_one({"chat_id": int(cid)}, {"$set": {field: int(val)}})
-    await cb.answer("Настройка сохранена")
+    await cb.answer("Сохранено")
     await cfg_ch(cb)
 
-@dp.callback_query(F.data.startswith("input_"))
-async def input_val(cb: CallbackQuery):
-    _, mode, cid = cb.data.split("_")
-    state_data[cb.from_user.id] = {"mode": mode, "cid": cid}
-    await cb.message.answer(f"Введите число ({'часы' if mode=='ad' else 'секунды'}):")
-
-@dp.message(F.text & ~F.text.startswith('/'))
-async def process_input(m: types.Message):
-    uid = m.from_user.id
-    if uid in state_data:
-        if m.text.isdigit():
-            d = state_data[uid]
-            val = int(m.text)
-            if d['mode'] == "ad": val *= 3600
-            field = "ad_cd" if d['mode'] == "ad" else "msg_cd"
-            await col_channels.update_one({"chat_id": int(d['cid'])}, {"$set": {field: val}})
-            del state_data[uid]
-            await m.answer("Успешно обновлено!")
-        else: await m.answer("Введите число.")
-
-@dp.callback_query(F.data.startswith("mute_toggle_"))
-async def toggle_mute(cb: CallbackQuery):
-    cid = int(cb.data.split("_")[2])
-    c = await col_channels.find_one({"chat_id": cid})
-    new_state = not c.get("mute", False)
-    await col_channels.update_one({"chat_id": cid}, {"$set": {"mute": new_state}})
-    await cb.answer("Статус режима тишины изменен")
-    await cfg_ch(cb)
-
-# --- MONITORING ENGINE ---
+# --- CORE ENGINE: ВЫЧИСЛЕНИЕ АНОНИМОВ ---
 
 @dp.channel_post()
-async def filter_engine(post: types.Message):
+async def monitoring_engine(post: types.Message):
     cid = post.chat.id
     conf = await col_channels.find_one({"chat_id": cid})
-    if not conf or not post.author_signature: return
-    
-    if conf.get("mute"):
-        try: await post.delete(); return
-        except: pass
+    if not conf: return
 
     try:
         now = time.time()
-        # Кэширование списка админов (5 минут), чтобы бот не "моросил"
-        if cid not in admin_cache or now - admin_cache[cid]['t'] > 300:
+        # Кэширование админов на 5 минут для оптимизации
+        if cid not in admin_cache or (now - admin_cache[cid]['t']) > 300:
             admins = await bot.get_chat_administrators(cid)
             admin_cache[cid] = {'t': now, 'list': admins}
-        else: admins = admin_cache[cid]['list']
+        else:
+            admins = admin_cache[cid]['list']
 
-        for a in admins:
-            if a.user.full_name == post.author_signature or a.custom_title == post.author_signature:
-                if a.status == 'creator' or a.user.id == conf['owner_id']: return
-                
-                # Глобальный ЧС
-                if await col_blacklist.find_one({"user_id": a.user.id}):
-                    await post.delete(); return
+        target_id = None
+        is_owner_action = False
 
-                is_ad = any([post.photo, post.video, post.forward_date, post.entities, post.reply_markup])
-                limit = conf['ad_cd'] if is_ad else conf['msg_cd']
-                
-                key = f"{cid}_{a.user.id}"
-                last_doc = await col_logs.find_one({"_id": key}) or {'t': 0}
-                
-                if (now - last_doc['t']) < limit:
-                    await post.delete()
-                    await col_channels.update_one({"chat_id": cid}, {"$inc": {"total": 1}})
-                    await col_history.insert_one({"cid": cid, "admin": a.user.full_name, "t": now, "type": "ad" if is_ad else "msg"})
-                else:
-                    await col_logs.update_one({"_id": key}, {"$set": {"t": now}}, upsert=True)
-                break
+        # 1. Проверка по подписи
+        if post.author_signature:
+            for a in admins:
+                if a.user.full_name == post.author_signature or a.custom_title == post.author_signature:
+                    if a.status == 'creator' or a.user.id == conf['owner_id']:
+                        is_owner_action = True
+                    target_id = a.user.id
+                    break
+        
+        # 2. Если подписи нет, но sender_chat == cid (Анонимный админ)
+        if not target_id and post.sender_chat and post.sender_chat.id == cid:
+            # В Telegram анонимно может писать любой админ с правом анонимности.
+            # Мы помечаем его как анонима, если не доказано, что это владелец.
+            target_id = "anonymous_admin"
+        
+        if is_owner_action: return # Владельца не трогаем никогда
+
+        if target_id:
+            # Реклама или текст?
+            is_ad = any([post.photo, post.video, post.forward_date, post.entities, post.reply_markup])
+            limit = conf['ad_cd'] if is_ad else conf['msg_cd']
+            
+            log_key = f"{cid}_{target_id}"
+            last_log = await col_logs.find_one({"_id": log_key}) or {'t': 0}
+            
+            if (now - last_log['t']) < limit:
+                await post.delete()
+                if target_id != "anonymous_admin":
+                    try:
+                        remain = get_format_time(limit - (now - last_log['t']))
+                        await bot.send_message(target_id, f"Удалено в {post.chat.title}. КД не прошло. Осталось: {remain}")
+                    except Exception: pass
+            else:
+                await col_logs.update_one({"_id": log_key}, {"$set": {"t": now}}, upsert=True)
+
     except Exception as e:
-        logging.error(f"Error in filter: {e}")
+        logging.error(f"Engine Error: {e}")
 
-# --- ADMIN PANEL ---
+# --- STARTUP ---
 
-@dp.callback_query(F.data == "admin_main")
-async def admin_main(cb: CallbackQuery):
-    if cb.from_user.id not in ADMINS: return
-    u, c = await col_users.count_documents({}), await col_channels.count_documents({})
-    kb = [
-        [InlineKeyboardButton(text="Рассылка", callback_data="broadcast")],
-        [InlineKeyboardButton(text="Назад", callback_data="back_to_start")]
-    ]
-    await cb.message.edit_text(f"АДМИН ПАНЕЛЬ\nЮзеров: {u}\nКаналов: {c}", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
-
-@dp.callback_query(F.data == "back_to_start")
+@dp.callback_query(F.data == "to_start")
 async def to_start(cb: CallbackQuery): await cmd_start(cb.message)
 
-async def start():
-    Thread(target=lambda: app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 8080)))).start()
+async def main():
+    Thread(target=lambda: app.run(host='0.0.0.0', port=8080)).start()
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
-    asyncio.run(start())
-
+    asyncio.run(main())
