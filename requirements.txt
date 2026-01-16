@@ -1,0 +1,4 @@
+aiogram==3.10.0
+flask==3.0.3
+gunicorn
+
