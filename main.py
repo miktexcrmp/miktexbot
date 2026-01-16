@@ -15,12 +15,14 @@ logging.basicConfig(level=logging.INFO)
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 user_editing = {}
+broadcast_mode = {}
 
 cluster = AsyncIOMotorClient(MONGO_URL)
 db = cluster.miktex_db
 channels_col = db.channels
 whitelist_col = db.whitelist
 stats_col = db.stats
+users_col = db.users
 
 app = Flask(__name__)
 @app.route('/')
@@ -51,12 +53,8 @@ async def monitor(post: types.Message):
             sig = post.author_signature
             if sig and (a.user.full_name == sig or a.custom_title == sig):
                 uid = a.user.id
-                
-                if a.status == 'creator' or uid == conf['owner_id']:
-                    return
-
-                if await whitelist_col.find_one({"chat_id": cid, "user_id": uid}):
-                    return
+                if a.status == 'creator' or uid == conf['owner_id']: return
+                if await whitelist_col.find_one({"chat_id": cid, "user_id": uid}): return
                 
                 is_ad = any([post.photo, post.video, post.forward_date, post.entities, post.caption_entities, post.document, post.reply_markup])
                 limit = conf['ad_cd'] if is_ad else conf['msg_cd']
@@ -78,24 +76,29 @@ async def monitor(post: types.Message):
 
 @dp.message(Command("start"))
 async def cmd_start(m: types.Message):
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Мои каналы", callback_data="list_all")]])
-    await m.answer(f"MIKTEX CONTROL - Разработчик MIKTEX\n\nВаш ID: {m.from_user.id}\nДля привязки: добавьте бота в канал как админа и перешлите пост сюда.", reply_markup=kb)
+    await users_col.update_one({"user_id": m.from_user.id}, {"$set": {"user_id": m.from_user.id}}, upsert=True)
+    
+    kb = [[InlineKeyboardButton(text="Мои каналы", callback_data="list_all")]]
+    if m.from_user.id in ADMINS:
+        kb.append([InlineKeyboardButton(text="Рассылка", callback_data="admin_broadcast")])
+    
+    await m.answer(f"MIKTEX CONTROL - Разработчик MIKTEX\n\nВаш ID: {m.from_user.id}\nДля привязки: добавьте бота в канал как админа и перешлите пост сюда.", 
+                   reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+
+@dp.callback_query(F.data == "admin_broadcast")
+async def start_broadcast(cb: CallbackQuery):
+    broadcast_mode[cb.from_user.id] = True
+    await cb.message.answer("Введите текст рассылки или прикрепите медиа:")
+    await cb.answer()
 
 @dp.message(F.forward_from_chat)
 async def register(m: types.Message):
-    cid = m.forward_from_chat.id
-    requester = m.from_user.id
+    cid, requester = m.forward_from_chat.id, m.from_user.id
     creator_id = await get_creator_id(cid)
-
     if requester not in ADMINS and requester != creator_id:
         return await m.answer("Ошибка: Добавить канал может только его Создатель.")
-
     owner = creator_id if creator_id else requester
-    await channels_col.update_one(
-        {"chat_id": cid}, 
-        {"$set": {"title": m.forward_from_chat.title, "owner_id": owner}, "$setOnInsert": {"ad_cd": 18000, "msg_cd": 30}}, 
-        upsert=True
-    )
+    await channels_col.update_one({"chat_id": cid}, {"$set": {"title": m.forward_from_chat.title, "owner_id": owner}, "$setOnInsert": {"ad_cd": 18000, "msg_cd": 30}}, upsert=True)
     await m.answer(f"MIKTEX CONTROL\nКанал успешно привязан.\nВладелец: {owner}")
 
 @dp.callback_query(F.data == "list_all")
@@ -104,11 +107,9 @@ async def list_all(cb: CallbackQuery):
     btns = []
     async for r in cursor:
         btns.append([InlineKeyboardButton(text=r['title'], callback_data=f"manage_{r['chat_id']}")] )
-    
     if not btns:
         return await cb.message.edit_text("У тебя нету канала, привяжи его. Для этого перешли пост из своего канала сюда.", 
                                          reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Назад", callback_data="back_start")]]))
-    
     await cb.message.edit_text("Ваши каналы под защитой:", reply_markup=InlineKeyboardMarkup(inline_keyboard=btns))
 
 @dp.callback_query(F.data == "back_start")
@@ -137,11 +138,27 @@ async def input_val(cb: CallbackQuery):
     user_editing[cb.from_user.id] = {"m": mode, "c": cid, "u": unit}
     await cb.message.edit_text("Введите число:")
 
-@dp.message(F.text)
-async def handle_text(m: types.Message):
+@dp.message()
+async def handle_all_messages(m: types.Message):
     uid = m.from_user.id
+    
+    # Режим рассылки
+    if uid in broadcast_mode:
+        del broadcast_mode[uid]
+        users = users_col.find()
+        count = 0
+        async for user in users:
+            try:
+                await m.copy_to(user['user_id'])
+                count += 1
+                await asyncio.sleep(0.05)
+            except: pass
+        await m.answer(f"Рассылка завершена. Получили: {count} пользователей.")
+        return
+
+    # Режим редактирования КД
     if uid in user_editing:
-        if m.text.isdigit():
+        if m.text and m.text.isdigit():
             d = user_editing[uid]
             val = int(m.text) * (60 if d['u'] == 'm' else 3600)
             col = 'ad_cd' if d['m'] == 'ad' else 'msg_cd'
@@ -183,4 +200,3 @@ async def start_bot():
 
 if __name__ == "__main__":
     asyncio.run(start_bot())
-        
