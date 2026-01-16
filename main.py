@@ -24,7 +24,7 @@ col_logs = db.logs
 
 app = Flask(__name__)
 @app.route('/')
-def index(): return "MIKTEX CORE ACTIVE"
+def index(): return "MIKTEX CONTROL - Разработчик MIKTEX"
 
 # --- CACHE & UTILS ---
 admin_cache = {} # Хранит список админов, чтобы не дергать API ТГ каждую секунду
@@ -183,3 +183,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
