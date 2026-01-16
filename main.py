@@ -2,7 +2,7 @@ import os, time, asyncio, logging
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.types import (InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, 
-                           KeyboardButton, ReplyKeyboardMarkup, KeyboardButtonRequestChat)
+                           KeyboardButton, ReplyKeyboardMarkup, KeyboardButtonRequestChat, ChatAdministratorRights)
 from flask import Flask
 from threading import Thread
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -41,12 +41,21 @@ def format_time(seconds):
 async def cmd_start(m: types.Message):
     await auto_collect_user(m.from_user)
     
-    # Кнопка для выбора канала пользователем
+    # Кнопка запроса канала, где пользователь является СОЗДАТЕЛЕМ
     request_kb = ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(
-                text="Выбрать канал для привязки", 
-                request_chat=KeyboardButtonRequestChat(request_id=1, chat_is_channel=True)
+                text="Привязать мой канал", 
+                request_chat=KeyboardButtonRequestChat(
+                    request_id=1, 
+                    chat_is_channel=True,
+                    chat_is_created=True, # Показывает только созданные пользователем каналы
+                    bot_is_member=True,
+                    bot_administrator_rights=ChatAdministratorRights(
+                        can_delete_messages=True,
+                        is_anonymous=False
+                    )
+                )
             )]
         ],
         resize_keyboard=True
@@ -56,7 +65,7 @@ async def cmd_start(m: types.Message):
     if m.from_user.id in ADMINS:
         inline_kb.append([InlineKeyboardButton(text="АДМИН ПАНЕЛЬ", callback_data="admin_main")])
     
-    await m.answer("MIKTEX CONTROL\n\n1. Нажмите кнопку ниже\n2. Выберите ваш канал\n3. Обязательно добавьте бота в админы и дайте права на Удаление сообщений.", 
+    await m.answer("MIKTEX CONTROL\n\nНажмите кнопку ниже, чтобы выбрать созданный вами канал и привязать его.", 
                    reply_markup=request_kb)
     await m.answer("Управление:", reply_markup=InlineKeyboardMarkup(inline_keyboard=inline_kb))
 
@@ -66,12 +75,11 @@ async def on_chat_shared(m: types.Message):
     chat_id = m.chat_shared.chat_id
     
     try:
-        # Проверка, добавлен ли бот и есть ли права
         chat = await bot.get_chat(chat_id)
         member = await bot.get_chat_member(chat_id, bot.id)
         
-        if not member.can_delete_messages:
-            return await m.answer(f"ВНИМАНИЕ: В канале {chat.title} не выданы права на удаление сообщений. Работа бота невозможна.")
+        if member.status not in ['administrator', 'creator'] or not member.can_delete_messages:
+            return await m.answer(f"Ошибка: Не выданы права на удаление сообщений в {chat.title}.")
 
         await channels_col.update_one(
             {"chat_id": chat_id}, 
@@ -79,12 +87,12 @@ async def on_chat_shared(m: types.Message):
              "$setOnInsert": {"ad_cd": 18000, "msg_cd": 30}}, 
             upsert=True
         )
-        await m.answer(f"Канал {chat.title} успешно привязан.")
+        await m.answer(f"Канал {chat.title} успешно интегрирован в систему.")
         
     except Exception:
-        await m.answer("Ошибка: Бот не найден в канале. Сначала добавьте бота в канал как администратора с правом удаления сообщений.")
+        await m.answer("Ошибка доступа. Убедитесь, что бот добавлен в канал.")
 
-# --- ОСТАЛЬНАЯ ЛОГИКА (АДМИНКА И МОНИТОРИНГ) ---
+# --- ЛОГИКА АДМИНКИ И МОНИТОРИНГА ---
 
 @dp.callback_query(F.data == "admin_main")
 async def admin_main(cb: CallbackQuery):
@@ -107,7 +115,7 @@ async def admin_all_channels(cb: CallbackQuery):
     async for r in cursor:
         btns.append([InlineKeyboardButton(text=r['title'], callback_data=f"manage_{r['chat_id']}")] )
     btns.append([InlineKeyboardButton(text="Назад", callback_data="admin_main")])
-    await cb.message.edit_text("Все каналы системы:", reply_markup=InlineKeyboardMarkup(inline_keyboard=btns))
+    await cb.message.edit_text("Список всех ресурсов:", reply_markup=InlineKeyboardMarkup(inline_keyboard=btns))
 
 @dp.callback_query(F.data == "list_all")
 async def list_all(cb: CallbackQuery):
@@ -116,7 +124,7 @@ async def list_all(cb: CallbackQuery):
     async for r in cursor:
         btns.append([InlineKeyboardButton(text=r['title'], callback_data=f"manage_{r['chat_id']}")] )
     if not btns:
-        return await cb.message.edit_text("Каналы не привязаны.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Назад", callback_data="back_start")]]))
+        return await cb.message.edit_text("Ресурсы не найдены.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Назад", callback_data="back_start")]]))
     await cb.message.edit_text("Ваши каналы:", reply_markup=InlineKeyboardMarkup(inline_keyboard=btns))
 
 @dp.callback_query(F.data.startswith("manage_"))
@@ -141,30 +149,25 @@ async def handle_all(m: types.Message):
     if uid in broadcast_mode:
         del broadcast_mode[uid]
         users = users_col.find()
-        success = 0
         async for user in users:
-            try:
-                await m.copy_to(user['user_id'])
-                success += 1
-                await asyncio.sleep(0.05)
+            try: await m.copy_to(user['user_id'])
             except: pass
-        await m.answer(f"Рассылка завершена. Успешно: {success}")
+        await m.answer("Рассылка завершена.")
         return
     if uid in user_editing:
         if m.text and m.text.isdigit():
             d = user_editing[uid]
             val = int(m.text) * (60 if d['u'] == 'm' else 3600)
-            col = 'ad_cd' if d['m'] == 'ad' else 'msg_cd'
-            await channels_col.update_one({"chat_id": int(d['c'])}, {"$set": {col: val}})
+            await channels_col.update_one({"chat_id": int(d['c'])}, {"$set": {'ad_cd' if d['m'] == 'ad' else 'msg_cd': val}})
             del user_editing[uid]
-            await m.answer("Настройки сохранены.")
+            await m.answer("Параметры обновлены.")
         return
 
 @dp.callback_query(F.data.startswith("set_"))
 async def set_val(cb: CallbackQuery):
     _, mode, cid = cb.data.split("_")
     kb = [[InlineKeyboardButton(text="Минуты", callback_data=f"in_m_{mode}_{cid}"), InlineKeyboardButton(text="Часы", callback_data=f"in_h_{mode}_{cid}")]]
-    await cb.message.edit_text("Единица времени:", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+    await cb.message.edit_text("Единица измерения:", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
 
 @dp.callback_query(F.data.startswith("in_"))
 async def input_val(cb: CallbackQuery):
@@ -181,8 +184,7 @@ async def white(cb: CallbackQuery):
         for a in admins:
             if not a.user.is_bot and a.status != 'creator':
                 is_w = await whitelist_col.find_one({"chat_id": cid, "user_id": a.user.id})
-                status = "БЕЛЫЙ" if is_w else "КД"
-                kb.append([InlineKeyboardButton(text=f"{a.user.first_name}: {status}", callback_data=f"tw_{cid}_{a.user.id}")])
+                kb.append([InlineKeyboardButton(text=f"{a.user.first_name}: {'БЕЛЫЙ' if is_w else 'КД'}", callback_data=f"tw_{cid}_{a.user.id}")])
         kb.append([InlineKeyboardButton(text="Назад", callback_data=f"manage_{cid}")])
         await cb.message.edit_text("Белый список:", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
     except: pass
@@ -208,18 +210,17 @@ async def monitor(post: types.Message):
             sig = post.author_signature
             if sig and (a.user.full_name == sig or a.custom_title == sig):
                 uid = a.user.id
-                if a.status == 'creator' or uid == conf['owner_id']: return
-                if await whitelist_col.find_one({"chat_id": cid, "user_id": uid}): return
+                if a.status == 'creator' or uid == conf['owner_id'] or await whitelist_col.find_one({"chat_id": cid, "user_id": uid}): return
                 is_ad = any([post.photo, post.video, post.forward_date, post.entities, post.caption_entities, post.document, post.reply_markup])
                 limit = conf['ad_cd'] if is_ad else conf['msg_cd']
                 st = await stats_col.find_one({"chat_id": cid, "user_id": uid}) or {"last_time": 0, "last_warn_id": 0}
                 wait = limit - (now - st['last_time'])
                 if wait > 0:
                     await post.delete()
-                    if st['last_warn_id'] != 0:
+                    if st['last_warn_id']:
                         try: await bot.delete_message(uid, st['last_warn_id'])
                         except: pass
-                    warn = await bot.send_message(uid, f"MIKTEX CONTROL\nКанал: {post.chat.title}\nУдалено (КД)\nЖдать: {format_time(wait)}")
+                    warn = await bot.send_message(uid, f"Уведомление КД\nКанал: {post.chat.title}\nУдалено. Ждать: {format_time(wait)}")
                     await stats_col.update_one({"chat_id": cid, "user_id": uid}, {"$set": {"last_time": st['last_time'], "last_warn_id": warn.message_id}}, upsert=True)
                 else:
                     await stats_col.update_one({"chat_id": cid, "user_id": uid}, {"$set": {"last_time": now, "last_warn_id": 0}}, upsert=True)
@@ -233,5 +234,4 @@ async def start_bot():
 
 if __name__ == "__main__":
     asyncio.run(start_bot())
-
-
+      
