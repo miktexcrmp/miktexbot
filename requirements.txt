@@ -1,7 +1,5 @@
 aiogram
-flask
 motor
-dnspython
-
-
+flask
+aiohttp
 
