@@ -4,9 +4,9 @@ from flask import Flask
 from motor.motor_asyncio import AsyncIOMotorClient
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, ReplyKeyboardMarkup, KeyboardButton, KeyboardButtonRequestChat
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 
-# CONFIG
+# --- CONFIG ---
 ADMINS = [8128433095]
 MONGO_URL = "mongodb+srv://miktexstudio:roma1111@cluster0.6damzqi.mongodb.net/"
 TOKEN = "8556619747:AAFA1ZOfobW_N7dt2fhrPPBl7jTdHAPWfzc"
@@ -21,62 +21,58 @@ col_channels, col_users, col_logs = db.channels, db.users, db.logs
 
 app = Flask(__name__)
 @app.route('/')
-def index(): return "SYSTEM_ONLINE"
+def index(): return "ONLINE"
 
 def get_format_time(s):
     if s < 60: return f"{int(s)}s"
     if s < 3600: return f"{int(s//60)}m"
     return f"{int(s//3600)}h"
 
-# ГЛАВНОЕ МЕНЮ
+# --- ИНТЕРФЕЙС ---
+
 @dp.message(Command("start"))
 async def cmd_start(m: types.Message):
     await col_users.update_one({"user_id": m.from_user.id}, {"$set": {"user_id": m.from_user.id}}, upsert=True)
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Привязать канал", callback_data="show_keyboard")],
-        [InlineKeyboardButton(text="Мои каналы", callback_data="list")]
+        [InlineKeyboardButton(text="Привязать канал", callback_data="add_instr")],
+        [InlineKeyboardButton(text="Мои ресурсы", callback_data="list")]
     ])
-    await m.answer("MIKTEX CONTROL\nВыберите действие:", reply_markup=kb)
+    await m.answer("MIKTEX CONTROL\nСистема готова.", reply_markup=kb)
 
-# ВЫЗОВ КЛАВИАТУРЫ ВЫБОРА
-@dp.callback_query(F.data == "show_keyboard")
-async def show_keyboard(cb: CallbackQuery):
-    kb = ReplyKeyboardMarkup(keyboard=[
-        [KeyboardButton(
-            text="Выбрать канал",
-            request_chat=KeyboardButtonRequestChat(
-                request_id=1,
-                chat_is_channel=True,
-                bot_is_member=True,
-                bot_administrator_rights=types.ChatAdministratorRights(can_delete_messages=True)
-            )
-        )]
-    ], resize_keyboard=True, one_time_keyboard=True)
+@dp.callback_query(F.data == "add_instr")
+async def add_instr(cb: CallbackQuery):
+    await cb.message.edit_text(
+        "ИНСТРУКЦИЯ:\n\n"
+        "1. Добавь бота в админы канала.\n"
+        "2. Дай ему право 'Удаление сообщений'.\n"
+        "3. **Перешли любое сообщение** из канала прямо в этот чат.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Назад", callback_data="to_start")]])
+    )
+
+# --- ПРИВЯЗКА ЧЕРЕЗ ПЕРЕСЫЛКУ ---
+@dp.message(F.forward_from_chat)
+async def handle_forward(m: types.Message):
+    if m.forward_from_chat.type != 'channel':
+        return await m.answer("Нужно переслать пост именно из КАНАЛА.")
     
-    await cb.message.answer("Используйте кнопку выбора внизу:", reply_markup=kb)
-    await cb.answer()
-
-# ОБРАБОТКА ВЫБРАННОГО КАНАЛА
-@dp.message(F.chat_shared)
-async def chat_shared_handler(m: types.Message):
-    chat_id = m.chat_shared.chat_id
+    cid = m.forward_from_chat.id
     try:
-        member = await bot.get_chat_member(chat_id, m.from_user.id)
-        if member.status != 'creator':
-            return await m.answer("Ошибка: Только владелец может привязать этот канал.", reply_markup=types.ReplyKeyboardRemove())
+        member = await bot.get_chat_member(cid, m.from_user.id)
+        if member.status != 'creator' and m.from_user.id not in ADMINS:
+            return await m.answer("Ошибка: Привязывать может только Владелец.")
         
-        chat = await bot.get_chat(chat_id)
+        chat = await bot.get_chat(cid)
         await col_channels.update_one(
-            {"chat_id": chat_id},
+            {"chat_id": cid},
             {"$set": {"title": chat.title, "owner_id": m.from_user.id},
              "$setOnInsert": {"ad_cd": 18000, "msg_cd": 30}},
             upsert=True
         )
-        await m.answer(f"Канал {chat.title} привязан.", reply_markup=types.ReplyKeyboardRemove())
+        await m.answer(f"✅ Канал '{chat.title}' успешно привязано!")
     except Exception:
-        await m.answer("Ошибка: Проверьте права бота в канале.", reply_markup=types.ReplyKeyboardRemove())
+        await m.answer("❌ Ошибка: Сначала сделай бота админом в канале!")
 
-# УПРАВЛЕНИЕ
+# --- УПРАВЛЕНИЕ ---
 @dp.callback_query(F.data == "list")
 async def list_ch(cb: CallbackQuery):
     cursor = col_channels.find({"owner_id": cb.from_user.id})
@@ -84,7 +80,7 @@ async def list_ch(cb: CallbackQuery):
     async for r in cursor:
         btns.append([InlineKeyboardButton(text=r['title'], callback_data=f"cfg_{r['chat_id']}")])
     btns.append([InlineKeyboardButton(text="Назад", callback_data="to_start")])
-    await cb.message.edit_text("Ваши каналы:", reply_markup=InlineKeyboardMarkup(inline_keyboard=btns))
+    await cb.message.edit_text("Ваши ресурсы:", reply_markup=InlineKeyboardMarkup(inline_keyboard=btns))
 
 @dp.callback_query(F.data.startswith("cfg_"))
 async def cfg_ch(cb: CallbackQuery):
@@ -96,7 +92,7 @@ async def cfg_ch(cb: CallbackQuery):
     kb = [[InlineKeyboardButton(text="Реклама (ч)", callback_data=f"set_ad_{cid}"),
            InlineKeyboardButton(text="Текст (с)", callback_data=f"set_msg_{cid}")],
           [InlineKeyboardButton(text="Назад", callback_data="list")]]
-    await cb.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+    await cb.message.edit_text(text, reply_markup=kb)
 
 @dp.callback_query(F.data.startswith("set_"))
 async def set_vals(cb: CallbackQuery):
@@ -104,7 +100,7 @@ async def set_vals(cb: CallbackQuery):
     vals = [1, 2, 6, 12, 24] if mode == "ad" else [10, 15, 20, 30, 45, 60]
     row = [InlineKeyboardButton(text=f"{v}{'h' if mode=='ad' else 's'}", 
            callback_data=f"sv_{mode}_{cid}_{v * 3600 if mode=='ad' else v}") for v in vals]
-    await cb.message.edit_text("Установка лимита:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[row, [InlineKeyboardButton(text="Назад", callback_data=f"cfg_{cid}")]]))
+    await cb.message.edit_text("Новый лимит:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[row, [InlineKeyboardButton(text="Назад", callback_data=f"cfg_{cid}")]]))
 
 @dp.callback_query(F.data.startswith("sv_"))
 async def save_vals(cb: CallbackQuery):
@@ -113,7 +109,7 @@ async def save_vals(cb: CallbackQuery):
     await cb.answer("Сохранено")
     await cfg_ch(cb)
 
-# МОНИТОРИНГ
+# --- МОНИТОРИНГ (ДЕТЕКТОР АНОНИМОВ) ---
 @dp.channel_post()
 async def monitor(post: types.Message):
     cid = post.chat.id
@@ -124,6 +120,7 @@ async def monitor(post: types.Message):
         now = time.time()
         target_id = None
         
+        # 1. Детект по подписи
         if post.author_signature:
             admins = await bot.get_chat_administrators(cid)
             for a in admins:
@@ -132,6 +129,7 @@ async def monitor(post: types.Message):
                     target_id = a.user.id
                     break
         
+        # 2. Детект анонимов (метод исключения)
         if not target_id and post.sender_chat and post.sender_chat.id == cid:
             target_id = "anonymous_admin"
 
@@ -146,7 +144,7 @@ async def monitor(post: types.Message):
                 if target_id != "anonymous_admin":
                     try:
                         rem = get_format_time(limit - (now - last['t']))
-                        await bot.send_message(target_id, f"Удалено в {post.chat.title}. Ожидание: {rem}")
+                        await bot.send_message(target_id, f"Удалено в {post.chat.title}. КД: {rem}")
                     except: pass
             else:
                 await col_logs.update_one({"_id": key}, {"$set": {"t": now}}, upsert=True)
@@ -162,4 +160,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-    
+        
