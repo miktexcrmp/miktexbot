@@ -27,7 +27,8 @@ state_data = {}
 
 def get_format_time(s):
     if s < 60: return f"{s}с"
-    return f"{s//60}м"
+    if s < 3600: return f"{s//60}м"
+    return f"{s//3600}ч"
 
 # --- КОМАНДЫ ---
 @dp.message(Command("start"))
@@ -73,8 +74,8 @@ async def manage_ch(cb: CallbackQuery):
     c = await col_channels.find_one({"chat_id": cid})
     text = f"КАНАЛ: {c['title']}\n\nКД Реклама: {get_format_time(c['ad_cd'])}\nКД Текст: {get_format_time(c['msg_cd'])}\nУдалено всего: {c.get('total_del', 0)}"
     kb = [
-        [InlineKeyboardButton(text="Настроить КД Рекламы", callback_data=f"set_ad_{cid}")],
-        [InlineKeyboardButton(text="Настроить КД Текста", callback_data=f"set_msg_{cid}")],
+        [InlineKeyboardButton(text="Настроить КД Рекламы (Часы)", callback_data=f"set_ad_{cid}")],
+        [InlineKeyboardButton(text="Настроить КД Текста (Сек)", callback_data=f"set_msg_{cid}")],
         [InlineKeyboardButton(text="Назад", callback_data="list")]
     ]
     await cb.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
@@ -82,18 +83,31 @@ async def manage_ch(cb: CallbackQuery):
 @dp.callback_query(F.data.startswith("set_"))
 async def set_cd(cb: CallbackQuery):
     _, mode, cid = cb.data.split("_")
-    # Пресеты времени
-    times = [15, 30, 60, 300, 600, 1800, 3600, 18000]
     btns = []
     row = []
-    for t in times:
-        row.append(InlineKeyboardButton(text=get_format_time(t), callback_data=f"save_{mode}_{cid}_{t}"))
-        if len(row) == 4:
-            btns.append(row)
-            row = []
-    btns.append([InlineKeyboardButton(text="Ввести свое время (сек)", callback_data=f"input_{mode}_{cid}")])
+    
+    if mode == "ad":
+        # Реклама в часах
+        times = [1, 2, 3, 4, 5, 6, 12, 24]
+        for t in times:
+            row.append(InlineKeyboardButton(text=f"{t}ч", callback_data=f"save_ad_{cid}_{t*3600}"))
+            if len(row) == 4:
+                btns.append(row); row = []
+    else:
+        # Текст в секундах
+        times = [10, 15, 20, 30, 40, 60]
+        for t in times:
+            row.append(InlineKeyboardButton(text=f"{t}с", callback_data=f"save_msg_{cid}_{t}"))
+            if len(row) == 3:
+                btns.append(row); row = []
+                
+    if row: btns.append(row)
+    
+    btns.append([InlineKeyboardButton(text="Ввести свое значение", callback_data=f"input_{mode}_{cid}")])
     btns.append([InlineKeyboardButton(text="Назад", callback_data=f"manage_{cid}")])
-    await cb.message.edit_text("Выберите время из списка или введите вручную:", reply_markup=InlineKeyboardMarkup(inline_keyboard=btns))
+    
+    unit = "часы" if mode == "ad" else "секунды"
+    await cb.message.edit_text(f"Выберите КД ({unit}):", reply_markup=InlineKeyboardMarkup(inline_keyboard=btns))
 
 @dp.callback_query(F.data.startswith("save_"))
 async def save_cd(cb: CallbackQuery):
@@ -107,7 +121,8 @@ async def save_cd(cb: CallbackQuery):
 async def input_cd(cb: CallbackQuery):
     _, mode, cid = cb.data.split("_")
     state_data[cb.from_user.id] = {"mode": mode, "cid": cid}
-    await cb.message.answer("Введите количество секунд (числом):")
+    unit = "часов" if mode == "ad" else "секунд"
+    await cb.message.answer(f"Введите количество {unit} (просто число):")
 
 @dp.message(F.text)
 async def handle_text(m: types.Message):
@@ -115,8 +130,11 @@ async def handle_text(m: types.Message):
     if uid in state_data:
         if m.text.isdigit():
             d = state_data[uid]
+            val = int(m.text)
+            if d['mode'] == "ad": val *= 3600 # переводим часы админа в секунды для базы
+            
             field = "ad_cd" if d['mode'] == "ad" else "msg_cd"
-            await col_channels.update_one({"chat_id": int(d['cid'])}, {"$set": {field: int(m.text)}})
+            await col_channels.update_one({"chat_id": int(d['cid'])}, {"$set": {field: val}})
             del state_data[uid]
             await m.answer("Настройка обновлена!")
         else: await m.answer("Нужно ввести число.")
@@ -162,3 +180,4 @@ async def run():
 
 if __name__ == "__main__":
     asyncio.run(run())
+    
