@@ -23,7 +23,7 @@ col_history, col_blacklist = db.history, db.blacklist
 
 app = Flask(__name__)
 @app.route('/')
-def index(): return "MIKTEX CONTROL - MEGA VERSION ONLINE"
+def index(): return "MIKTEX CONTROL - Разработчик MIKTEX"
 
 # --- CACHE & STATES ---
 admin_cache = {}
@@ -211,3 +211,4 @@ async def start():
 
 if __name__ == "__main__":
     asyncio.run(start())
+
