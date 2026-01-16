@@ -1,236 +1,179 @@
-import os
-import sqlite3
-import time
-import asyncio
-import logging
+import os, time, asyncio, logging
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, ChatMemberUpdated
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from flask import Flask
 from threading import Thread
+from motor.motor_asyncio import AsyncIOMotorClient
 
-# Configuration
+# --- НАСТРОЙКИ ---
+ADMINS = [8128433095] 
+MONGO_URL = "mongodb+srv://miktexstudio:roma1111@cluster0.6damzqi.mongodb.net/" 
 TOKEN = "8556619747:AAFA1ZOfobW_N7dt2fhrPPBl7jTdHAPWfzc"
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
-
+logging.basicConfig(level=logging.INFO)
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 user_editing = {}
 
-# Database Initialization
-def get_db():
-    conn = sqlite3.connect('system.db', check_same_thread=False)
-    conn.execute('PRAGMA journal_mode=WAL')
-    conn.execute('PRAGMA synchronous=NORMAL')
-    return conn
+# Подключение к базе данных
+cluster = AsyncIOMotorClient(MONGO_URL)
+db = cluster.miktex_db
+channels_col = db.channels
+whitelist_col = db.whitelist
+stats_col = db.stats
 
-db = get_db()
-cur = db.cursor()
-
-def init_db():
-    cur.execute('''CREATE TABLE IF NOT EXISTS channels 
-                   (chat_id INTEGER PRIMARY KEY, title TEXT, owner_id INTEGER, 
-                    ad_cd INTEGER DEFAULT 18000, msg_cd INTEGER DEFAULT 30)''')
-    cur.execute('''CREATE TABLE IF NOT EXISTS whitelist 
-                   (chat_id INTEGER, user_id INTEGER, PRIMARY KEY (chat_id, user_id))''')
-    cur.execute('''CREATE TABLE IF NOT EXISTS stats 
-                   (chat_id INTEGER, user_id INTEGER, last_time INTEGER DEFAULT 0, 
-                    last_warn_id INTEGER DEFAULT 0, PRIMARY KEY (chat_id, user_id))''')
-    db.commit()
-
-init_db()
-
-# Web Server for Keep-Alive
 app = Flask(__name__)
 @app.route('/')
-def home():
-    return "MIKTEX CONTROL STATUS: ACTIVE"
+def home(): return "MIKTEX CONTROL - Разработчик MIKTEX"
 
 def format_time(seconds):
-    if seconds < 60: return f"{seconds}с"
-    if seconds < 3600: return f"{seconds // 60}м"
-    return f"{seconds // 3600}ч {(seconds % 3600) // 60}м"
+    if seconds < 60: return f"{seconds} сек"
+    if seconds < 3600: return f"{seconds // 60} мин"
+    return f"{seconds // 3600} час {(seconds % 3600) // 60} мин"
 
-# Core Logic
+async def register_channel(chat_id, title):
+    try:
+        admins = await bot.get_chat_administrators(chat_id)
+        creator_id = next((a.user.id for a in admins if a.status == 'creator'), ADMINS[0])
+        existing = await channels_col.find_one({"chat_id": chat_id})
+        if not existing:
+            await channels_col.insert_one({
+                "chat_id": chat_id, 
+                "title": title, 
+                "owner_id": creator_id,
+                "ad_cd": 18000, 
+                "msg_cd": 30
+            })
+            return f"Канал активирован. Владелец ID: {creator_id}"
+        else:
+            return "Канал находится в базе."
+    except Exception as e:
+        return f"Ошибка регистрации: {e}"
+
 @dp.channel_post()
-async def monitor_posts(post: types.Message):
-    chat_id = post.chat.id
-    timestamp = int(time.time())
-    
-    cur.execute("SELECT ad_cd, msg_cd FROM channels WHERE chat_id=?", (chat_id,))
-    config = cur.fetchone()
-    if not config:
+async def monitor(post: types.Message):
+    await register_channel(post.chat.id, post.chat.title)
+    cid, now = post.chat.id, int(time.time())
+    conf = await channels_col.find_one({"chat_id": cid})
+    if not conf: return
+
+    try:
+        admins = await bot.get_chat_administrators(cid)
+        for a in admins:
+            if a.status == 'creator': continue
+            sig = post.author_signature
+            if sig and (a.user.full_name == sig or a.custom_title == sig):
+                uid = a.user.id
+                if await whitelist_col.find_one({"chat_id": cid, "user_id": uid}): return
+                
+                is_ad = any([post.photo, post.video, post.forward_date, post.entities, post.caption_entities, post.document])
+                limit = conf['ad_cd'] if is_ad else conf['msg_cd']
+                
+                st = await stats_col.find_one({"chat_id": cid, "user_id": uid}) or {"last_time": 0, "last_warn_id": 0}
+                wait = limit - (now - st['last_time'])
+                
+                if wait > 0:
+                    await post.delete()
+                    if st['last_warn_id'] != 0:
+                        try: await bot.delete_message(uid, st['last_warn_id'])
+                        except: pass
+                    warn = await bot.send_message(uid, f"MIKTEX CONTROL\nУдалено в: {post.chat.title}\nПодождите: {format_time(wait)}")
+                    await stats_col.update_one({"chat_id": cid, "user_id": uid}, {"$set": {"last_time": st['last_time'], "last_warn_id": warn.message_id}}, upsert=True)
+                else:
+                    await stats_col.update_one({"chat_id": cid, "user_id": uid}, {"$set": {"last_time": now, "last_warn_id": 0}}, upsert=True)
+                return
+    except: pass
+
+@dp.message(Command("start"))
+async def cmd_start(m: types.Message):
+    is_owner = await channels_col.find_one({"owner_id": m.from_user.id})
+    if m.from_user.id not in ADMINS and not is_owner:
         return
 
-    try:
-        administrators = await bot.get_chat_administrators(chat_id)
-        for admin in administrators:
-            if admin.status == 'creator':
-                continue
-                
-            signature = post.author_signature
-            if signature and (admin.user.full_name == signature or admin.custom_title == signature):
-                user_id = admin.user.id
-                
-                cur.execute("SELECT 1 FROM whitelist WHERE chat_id=? AND user_id=?", (chat_id, user_id))
-                if cur.fetchone():
-                    return
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Список каналов", callback_data="list_all")]])
+    await m.answer(f"MIKTEX CONTROL - Разработчик MIKTEX\n\nID: {m.from_user.id}\nДля привязки перешлите пост из канала.", reply_markup=kb)
 
-                is_ad_content = any([
-                    post.photo, post.video, post.forward_date, 
-                    post.entities, post.caption_entities, 
-                    post.document, post.animation, post.audio
-                ])
-                
-                cooldown = config[0] if is_ad_content else config[1]
-
-                cur.execute("SELECT last_time, last_warn_id FROM stats WHERE chat_id=? AND user_id=?", (chat_id, user_id))
-                user_stats = cur.fetchone() or (0, 0)
-                
-                time_passed = timestamp - user_stats[0]
-                if time_passed < cooldown:
-                    remaining = cooldown - time_passed
-                    try:
-                        await post.delete()
-                        if user_stats[1] != 0:
-                            try: await bot.delete_message(user_id, user_stats[1])
-                            except: pass
-                            
-                        warning = await bot.send_message(
-                            user_id, 
-                            f"MIKTEX CONTROL\n\nКанал: {post.chat.title}\nСтатус: Пост удален (КД)\nДоступно через: {format_time(remaining)}"
-                        )
-                        cur.execute("INSERT OR REPLACE INTO stats (chat_id, user_id, last_time, last_warn_id) VALUES (?, ?, ?, ?)", 
-                                   (chat_id, user_id, user_stats[0], warning.message_id))
-                        db.commit()
-                    except Exception as e:
-                        logger.error(f"Failed to delete post or notify: {e}")
-                else:
-                    cur.execute("INSERT OR REPLACE INTO stats (chat_id, user_id, last_time, last_warn_id) VALUES (?, ?, ?, 0)", 
-                               (chat_id, user_id, timestamp))
-                    db.commit()
-                return
-    except Exception as e:
-        logger.error(f"Monitor error: {e}")
-
-# Interface
-@dp.message(Command("start"))
-async def cmd_start(message: types.Message):
-    bot_info = await bot.get_me()
-    invite_link = f"https://t.me/{bot_info.username}?startchannel=true&admin=post_messages+delete_messages+invite_users"
-    
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Привязать канал", url=invite_link)],
-        [InlineKeyboardButton(text="Список каналов", callback_data="list_all")]
-    ])
-    await message.answer("MIKTEX CONTROL Активен\nВыберите действие:", reply_markup=keyboard)
+@dp.message(F.forward_from_chat)
+async def admin_forward(m: types.Message):
+    if m.from_user.id not in ADMINS: return
+    status = await register_channel(m.forward_from_chat.id, m.forward_from_chat.title)
+    await m.answer(status)
 
 @dp.callback_query(F.data == "list_all")
-async def list_channels(callback: CallbackQuery):
-    cur.execute("SELECT chat_id, title FROM channels WHERE owner_id=?", (callback.from_user.id,))
-    rows = cur.fetchall()
-    buttons = [[InlineKeyboardButton(text=row[1], callback_data=f"manage_{row[0]}")] for row in rows]
+async def list_all(cb: CallbackQuery):
+    cursor = channels_col.find({"owner_id": cb.from_user.id})
+    btns = []
+    async for r in cursor:
+        btns.append([InlineKeyboardButton(text=r['title'], callback_data=f"manage_{r['chat_id']}")] )
     
-    if not buttons:
-        return await callback.answer("Список пуст", show_alert=True)
-        
-    await callback.message.edit_text("Ваши привязанные каналы:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+    if not btns: return await cb.answer("Каналов нет.", show_alert=True)
+    await cb.message.edit_text("Список каналов:", reply_markup=InlineKeyboardMarkup(inline_keyboard=btns))
 
 @dp.callback_query(F.data.startswith("manage_"))
-async def manage_channel(callback: CallbackQuery):
-    channel_id = int(callback.data.split("_")[1])
-    cur.execute("SELECT ad_cd, msg_cd, title FROM channels WHERE chat_id=?", (channel_id,))
-    data = cur.fetchone()
-    
-    text = (f"Управление: {data[2]}\n\n"
-            f"Задержка рекламы: {format_time(data[0])}\n"
-            f"Задержка текста: {format_time(data[1])}")
-            
-    keyboard = [
-        [InlineKeyboardButton(text="Изм. Рекламу", callback_data=f"set_ad_{channel_id}"), 
-         InlineKeyboardButton(text="Изм. Текст", callback_data=f"set_msg_{channel_id}")],
-        [InlineKeyboardButton(text="Белый список", callback_data=f"white_{channel_id}")],
-        [InlineKeyboardButton(text="Назад", callback_data="list_all")]
-    ]
-    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
+async def manage(cb: CallbackQuery):
+    cid = int(cb.data.split("_")[1])
+    res = await channels_col.find_one({"chat_id": cid})
+    text = f"MIKTEX CONTROL | {res['title']}\n\nКД Реклама: {format_time(res['ad_cd'])}\nКД Текст: {format_time(res['msg_cd'])}"
+    kb = [[InlineKeyboardButton(text="Изм. рекламу", callback_data=f"set_ad_{cid}"), InlineKeyboardButton(text="Изм. текст", callback_data=f"set_msg_{cid}")],
+          [InlineKeyboardButton(text="Белый список", callback_data=f"white_{cid}")],
+          [InlineKeyboardButton(text="Назад", callback_data="list_all")]]
+    await cb.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
 
 @dp.callback_query(F.data.startswith("set_"))
-async def set_cooldown(callback: CallbackQuery):
-    _, mode, cid = callback.data.split("_")
-    keyboard = [[InlineKeyboardButton(text="Минуты", callback_data=f"in_m_{mode}_{cid}"), 
-                 InlineKeyboardButton(text="Часы", callback_data=f"in_h_{mode}_{cid}")]]
-    await callback.message.edit_text("Выберите формат ввода числового значения:", reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
+async def set_val(cb: CallbackQuery):
+    _, mode, cid = cb.data.split("_")
+    kb = [[InlineKeyboardButton(text="Минуты", callback_data=f"in_m_{mode}_{cid}"), InlineKeyboardButton(text="Часы", callback_data=f"in_h_{mode}_{cid}")]]
+    await cb.message.edit_text("Выберите формат:", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
 
 @dp.callback_query(F.data.startswith("in_"))
-async def input_handler(callback: CallbackQuery):
-    _, unit, mode, cid = callback.data.split("_")
-    user_editing[callback.from_user.id] = {"mode": mode, "id": cid, "unit": unit}
-    await callback.message.edit_text("Введите числовое значение для сохранения:")
+async def input_val(cb: CallbackQuery):
+    _, unit, mode, cid = cb.data.split("_")
+    user_editing[cb.from_user.id] = {"m": mode, "c": cid, "u": unit}
+    await cb.message.edit_text("Введите число:")
 
 @dp.message(F.text)
-async def process_input(message: types.Message):
-    user_id = message.from_user.id
-    if user_id in user_editing:
-        if message.text.isdigit():
-            state = user_editing[user_id]
-            multiplier = 60 if state['unit'] == 'm' else 3600
-            new_value = int(message.text) * multiplier
-            column = 'ad_cd' if state['mode'] == 'ad' else 'msg_cd'
-            
-            cur.execute(f"UPDATE channels SET {column}=? WHERE chat_id=?", (new_value, int(state['id'])))
-            db.commit()
-            del user_editing[user_id]
-            await message.answer("Изменения успешно применены.")
-        else:
-            await message.answer("Ошибка: введите целое число.")
+async def handle_text(m: types.Message):
+    uid = m.from_user.id
+    if uid in user_editing:
+        if m.text.isdigit():
+            d = user_editing[uid]
+            val = int(m.text) * (60 if d['u'] == 'm' else 3600)
+            col = 'ad_cd' if d['m'] == 'ad' else 'msg_cd'
+            await channels_col.update_one({"chat_id": int(d['c'])}, {"$set": {col: val}})
+            del user_editing[uid]
+            await m.answer("Сохранено.")
+        else: await m.answer("Введите число.")
 
 @dp.callback_query(F.data.startswith("white_"))
-async def white_list_handler(callback: CallbackQuery):
-    channel_id = int(callback.data.split("_")[1])
-    try:
-        admins = await bot.get_chat_administrators(channel_id)
-        cur.execute("SELECT user_id FROM whitelist WHERE chat_id=?", (channel_id,))
-        whitelisted = [r[0] for r in cur.fetchall()]
-        
-        keyboard = []
-        for a in admins:
-            if not a.user.is_bot and a.status != 'creator':
-                status_label = "Разрешен" if a.user.id in whitelisted else "Ограничен"
-                keyboard.append([InlineKeyboardButton(text=f"{status_label}: {a.user.first_name}", callback_data=f"toggle_{channel_id}_{a.user.id}")])
-        
-        keyboard.append([InlineKeyboardButton(text="Назад", callback_data=f"manage_{channel_id}")])
-        await callback.message.edit_text("Настройка исключений (Белый список):", reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
-    except Exception:
-        await callback.answer("Ошибка доступа к списку администраторов", show_alert=True)
+async def white(cb: CallbackQuery):
+    cid = int(cb.data.split("_")[1])
+    admins = await bot.get_chat_administrators(cid)
+    kb = []
+    for a in admins:
+        if not a.user.is_bot and a.status != 'creator':
+            is_w = await whitelist_col.find_one({"chat_id": cid, "user_id": a.user.id})
+            status = "Доверенный" if is_w else "Ограничен"
+            kb.append([InlineKeyboardButton(text=f"{a.user.first_name}: {status}", callback_data=f"tw_{cid}_{a.user.id}")])
+    kb.append([InlineKeyboardButton(text="Назад", callback_data=f"manage_{cid}")])
+    await cb.message.edit_text("Белый список:", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
 
-@dp.callback_query(F.data.startswith("toggle_"))
-async def toggle_white(callback: CallbackQuery):
-    _, cid, uid = callback.data.split("_")
-    cur.execute("SELECT 1 FROM whitelist WHERE chat_id=? AND user_id=?", (int(cid), int(uid)))
-    if cur.fetchone():
-        cur.execute("DELETE FROM whitelist WHERE chat_id=? AND user_id=?", (int(cid), int(uid)))
+@dp.callback_query(F.data.startswith("tw_"))
+async def toggle(cb: CallbackQuery):
+    _, cid, uid = cb.data.split("_")
+    cid, uid = int(cid), int(uid)
+    if await whitelist_col.find_one({"chat_id": cid, "user_id": uid}):
+        await whitelist_col.delete_one({"chat_id": cid, "user_id": uid})
     else:
-        cur.execute("INSERT INTO whitelist VALUES (?, ?)", (int(cid), int(uid)))
-    db.commit()
-    await white_list_handler(callback)
+        await whitelist_col.insert_one({"chat_id": cid, "user_id": uid})
+    await white(cb)
 
-@dp.my_chat_member()
-async def on_chat_update(event: ChatMemberUpdated):
-    if event.new_chat_member.status in ["administrator", "member"]:
-        cur.execute("INSERT OR REPLACE INTO channels (chat_id, title, owner_id) VALUES (?, ?, ?)", 
-                   (event.chat.id, event.chat.title, event.from_user.id))
-        db.commit()
-
-async def main():
+async def start():
     port = int(os.environ.get("PORT", 8080))
     Thread(target=lambda: app.run(host='0.0.0.0', port=port)).start()
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        pass
+    asyncio.run(start())
+    
